@@ -10,4 +10,5 @@
 ## Completed
 
 - [x] **Show picture** - Support displaying images/pictures in chat messages. (2026-03-13)
+- [x] **Bug: Message truncated at Telegram when containing emoji or special chars** - Messages rich in emoji or Unicode characters are cut off mid-sentence in the chat panel. (2026-03-13)
 
