@@ -260,7 +260,10 @@ impl App {
                                         self.state.push_ai_log(format!(
                                             "[debounce] → POST {}/v1/chat/completions | model={} | ctx={} msgs | input={:?}",
                                             self.config.ai.base_url, self.config.ai.model, messages.len(),
-                                            if partial.len() > 40 { &partial[..40] } else { &partial }
+                                            {
+                                                let end = partial.char_indices().nth(40).map(|(i,_)| i).unwrap_or(partial.len());
+                                                &partial[..end]
+                                            }
                                         ));
                                         tracing::info!(
                                             trigger = "debounce",
@@ -885,10 +888,13 @@ impl App {
                             self.state.push_ai_log(format!(
                                 "[Ctrl+Space] → POST {}/v1/chat/completions | model={} | ctx={} msgs | input={:?}",
                                 self.config.ai.base_url, self.config.ai.model, messages.len(),
-                                if partial.len() > 40 { &partial[..40] } else { &partial }
-                            ));
-                            tracing::info!(
-                                trigger = "ctrl+space",
+                                {
+                                    let end = partial.char_indices().nth(40).map(|(i,_)| i).unwrap_or(partial.len());
+                                    &partial[..end]
+                                }
+                                            ));
+                                            tracing::info!(
+                                                trigger = "ctrl+space",
                                 url = %format!("{}/v1/chat/completions", self.config.ai.base_url),
                                 model = %self.config.ai.model,
                                 context_msgs = messages.len(),

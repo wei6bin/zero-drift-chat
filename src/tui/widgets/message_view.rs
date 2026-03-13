@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::core::types::UnifiedMessage;
 use crate::tui::app_state::ActivePanel;
@@ -270,7 +271,11 @@ pub fn render_message_view(
             if content_width == 0 {
                 return 1;
             }
-            let line_width: usize = line.spans.iter().map(|s| s.content.len()).sum();
+            let line_width: usize = line
+                .spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
             if line_width == 0 {
                 1
             } else {
