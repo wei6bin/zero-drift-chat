@@ -35,19 +35,43 @@ pub enum Action {
     SearchPrev,
     SearchConfirm,
     SearchClose,
-    AiSuggestAccept,   // Tab — accept ghost text suggestion
-    AiSuggestRequest,  // Ctrl+Space — on-demand trigger
+    AiSuggestAccept,    // Tab — accept ghost text suggestion
+    AiSuggestRequest,   // Ctrl+Space — on-demand trigger
+    CopyLastMessage,    // y — copy last message text to clipboard via OSC 52
+    EnterMessageSelect, // v — enter message selection mode
+    MessageSelectPrev,  // k/Up — move selection up (older)
+    MessageSelectNext,  // j/Down — move selection down (newer)
+    MessageSelectCopy,  // y — copy selected message and exit
+    MessageSelectExit,  // Esc — exit without copying
+    OpenMedia,          // Enter — open media attachment in viewer
+    ScheduleMessage,    // Ctrl+D — open schedule prompt
+    ScheduleInput(KeyEvent),
+    ScheduleConfirm,
+    ScheduleCancel,
+    OpenScheduleList, // Ctrl+L — open scheduled messages overlay
+    ScheduleListNext,
+    ScheduleListPrev,
+    ScheduleListDelete,
+    ScheduleListClose,
+    TelegramAuthChar(char),
+    TelegramAuthBackspace,
+    TelegramAuthSubmit,
+    TelegramAuthCancel,
     None,
 }
 
 pub fn map_key(key: KeyEvent, mode: InputMode, enter_sends: bool) -> Action {
     match mode {
-        InputMode::Normal   => map_normal_mode(key),
-        InputMode::Editing  => map_editing_mode(key, enter_sends),
+        InputMode::Normal => map_normal_mode(key),
+        InputMode::Editing => map_editing_mode(key, enter_sends),
         InputMode::Settings => map_settings_mode(key),
         InputMode::Renaming => map_renaming_mode(key),
         InputMode::ChatMenu => map_chat_menu_mode(key),
         InputMode::Searching => map_search_mode(key),
+        InputMode::MessageSelect => map_message_select_mode(key),
+        InputMode::SchedulePrompt => map_schedule_prompt_mode(key),
+        InputMode::ScheduleList => map_schedule_list_mode(key),
+        InputMode::TelegramAuth => map_telegram_auth_mode(key),
     }
 }
 
@@ -63,6 +87,11 @@ fn map_normal_mode(key: KeyEvent) -> Action {
         KeyCode::Char('r') => Action::RenameChat,
         KeyCode::Char('x') => Action::OpenChatMenu,
         KeyCode::Char('/') => Action::OpenSearch,
+        KeyCode::Char('y') => Action::CopyLastMessage,
+        KeyCode::Char('v') => Action::EnterMessageSelect,
+        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Action::OpenScheduleList
+        }
         KeyCode::PageUp => Action::ScrollUp,
         KeyCode::PageDown => Action::ScrollDown,
         _ => Action::None,
@@ -74,16 +103,16 @@ fn map_editing_mode(key: KeyEvent, enter_sends: bool) -> Action {
         (KeyCode::Esc, _) => Action::ExitEditing,
 
         // enter_sends=true (default): plain Enter submits, Shift/Alt+Enter inserts newline
-        (KeyCode::Enter, m)
-            if enter_sends && m == KeyModifiers::NONE => Action::SubmitMessage,
-        (KeyCode::Enter, _)
-            if enter_sends => Action::InputKey(key), // Shift/Alt+Enter → forward to textarea as newline
+        (KeyCode::Enter, m) if enter_sends && m == KeyModifiers::NONE => Action::SubmitMessage,
+        (KeyCode::Enter, _) if enter_sends => Action::InputKey(key), // Shift/Alt+Enter → forward to textarea as newline
 
         // enter_sends=false: Shift/Alt+Enter submits, plain Enter inserts newline
-        (KeyCode::Enter, m)
-            if !enter_sends && m.contains(KeyModifiers::SHIFT) => Action::SubmitMessage,
-        (KeyCode::Enter, m)
-            if !enter_sends && m.contains(KeyModifiers::ALT) => Action::SubmitMessage,
+        (KeyCode::Enter, m) if !enter_sends && m.contains(KeyModifiers::SHIFT) => {
+            Action::SubmitMessage
+        }
+        (KeyCode::Enter, m) if !enter_sends && m.contains(KeyModifiers::ALT) => {
+            Action::SubmitMessage
+        }
 
         // Ctrl+J: WSL-friendly newline insert (Shift+Enter not reliably transmitted in WSL)
         (KeyCode::Char('j'), m) if m.contains(KeyModifiers::CONTROL) => {
@@ -93,6 +122,7 @@ fn map_editing_mode(key: KeyEvent, enter_sends: bool) -> Action {
         (KeyCode::Char('s'), m) if m.contains(KeyModifiers::CONTROL) => Action::SubmitMessage,
         // Ctrl+U always clears
         (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => Action::ClearInput,
+        (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => Action::ScheduleMessage,
         (KeyCode::Tab, _) => Action::AiSuggestAccept,
         (KeyCode::Char(' '), m) if m.contains(KeyModifiers::CONTROL) => Action::AiSuggestRequest,
         // Everything else forwarded to TextArea
@@ -139,5 +169,72 @@ fn map_renaming_mode(key: KeyEvent) -> Action {
         // Block Shift+Enter / Alt+Enter from inserting newlines into a chat name
         (KeyCode::Enter, _) => Action::None,
         _ => Action::InputKey(key),
+    }
+}
+
+fn map_message_select_mode(key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Char('k') | KeyCode::Up => Action::MessageSelectPrev,
+        KeyCode::Char('j') | KeyCode::Down => Action::MessageSelectNext,
+        KeyCode::Char('y') => Action::MessageSelectCopy,
+        KeyCode::Enter => Action::OpenMedia,
+        KeyCode::Esc | KeyCode::Char('q') => Action::MessageSelectExit,
+        _ => Action::None,
+    }
+}
+
+fn map_schedule_prompt_mode(key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc => Action::ScheduleCancel,
+        KeyCode::Enter => Action::ScheduleConfirm,
+        _ => Action::ScheduleInput(key),
+    }
+}
+
+fn map_schedule_list_mode(key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => Action::ScheduleListNext,
+        KeyCode::Char('k') | KeyCode::Up => Action::ScheduleListPrev,
+        KeyCode::Char('d') => Action::ScheduleListDelete,
+        KeyCode::Esc | KeyCode::Char('q') => Action::ScheduleListClose,
+        _ => Action::None,
+    }
+}
+
+fn map_telegram_auth_mode(key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc => Action::TelegramAuthCancel,
+        KeyCode::Enter => Action::TelegramAuthSubmit,
+        KeyCode::Backspace => Action::TelegramAuthBackspace,
+        KeyCode::Char(c) => Action::TelegramAuthChar(c),
+        _ => Action::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn enter_in_message_select_maps_to_open_media() {
+        let action = map_key(key(KeyCode::Enter), InputMode::MessageSelect, true);
+        assert_eq!(action, Action::OpenMedia);
+    }
+
+    #[test]
+    fn y_in_message_select_maps_to_copy() {
+        let action = map_key(key(KeyCode::Char('y')), InputMode::MessageSelect, true);
+        assert_eq!(action, Action::MessageSelectCopy);
+    }
+
+    #[test]
+    fn esc_in_message_select_maps_to_exit() {
+        let action = map_key(key(KeyCode::Esc), InputMode::MessageSelect, true);
+        assert_eq!(action, Action::MessageSelectExit);
     }
 }

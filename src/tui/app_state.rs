@@ -2,7 +2,8 @@ use ratatui::widgets::ListState;
 use tui_textarea::TextArea;
 
 use crate::config::AppConfig;
-use crate::core::types::{UnifiedChat, UnifiedMessage};
+use crate::core::types::{Platform, UnifiedChat, UnifiedMessage};
+use crate::storage::ScheduledMessage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
@@ -12,6 +13,10 @@ pub enum InputMode {
     Renaming,
     ChatMenu,
     Searching,
+    MessageSelect,
+    SchedulePrompt,
+    ScheduleList,
+    TelegramAuth,
 }
 
 // --- Settings overlay types ---
@@ -140,10 +145,18 @@ impl ChatMenuItem {
     pub fn label(&self, is_pinned: bool, is_muted: bool) -> &'static str {
         match self {
             ChatMenuItem::TogglePin => {
-                if is_pinned { "Unpin" } else { "Pin" }
+                if is_pinned {
+                    "Unpin"
+                } else {
+                    "Pin"
+                }
             }
             ChatMenuItem::ToggleMute => {
-                if is_muted { "Unmute" } else { "Mute" }
+                if is_muted {
+                    "Unmute"
+                } else {
+                    "Mute"
+                }
             }
         }
     }
@@ -186,13 +199,112 @@ impl ChatMenuState {
 #[derive(Debug, Clone)]
 pub struct SearchState {
     pub query: String,
-    pub results: Vec<usize>,  // indices into AppState::chats (top 5)
-    pub selected: usize,      // currently highlighted result index
+    pub results: Vec<usize>, // indices into AppState::chats (top 5)
+    pub selected: usize,     // currently highlighted result index
 }
 
 impl SearchState {
     pub fn new() -> Self {
-        Self { query: String::new(), results: vec![], selected: 0 }
+        Self {
+            query: String::new(),
+            results: vec![],
+            selected: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SchedulePromptState {
+    pub query: String,
+    pub message_text: String, // the message to be scheduled
+    pub chat_id: String,
+    pub platform: Platform,
+}
+
+impl SchedulePromptState {
+    pub fn new(message_text: String, chat_id: String, platform: Platform) -> Self {
+        Self {
+            query: String::new(),
+            message_text,
+            chat_id,
+            platform,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ScheduleListState {
+    pub messages: Vec<ScheduledMessage>,
+    pub selected: usize,
+}
+
+impl ScheduleListState {
+    pub fn new(messages: Vec<ScheduledMessage>) -> Self {
+        Self {
+            messages,
+            selected: 0,
+        }
+    }
+
+    pub fn select_next(&mut self) {
+        if !self.messages.is_empty() && self.selected < self.messages.len() - 1 {
+            self.selected += 1;
+        }
+    }
+
+    pub fn select_prev(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramAuthStage {
+    Phone,
+    Otp,
+    Password,
+}
+
+impl TelegramAuthStage {
+    pub fn prompt(&self) -> &'static str {
+        match self {
+            TelegramAuthStage::Phone => {
+                "Enter your Telegram phone number (with country code, e.g. +1234567890):"
+            }
+            TelegramAuthStage::Otp => "Enter the code Telegram sent you:",
+            TelegramAuthStage::Password => "Enter your 2FA password:",
+        }
+    }
+
+    pub fn title(&self) -> &'static str {
+        match self {
+            TelegramAuthStage::Phone => " Telegram Login — Phone ",
+            TelegramAuthStage::Otp => " Telegram Login — Code ",
+            TelegramAuthStage::Password => " Telegram Login — 2FA Password ",
+        }
+    }
+
+    pub fn is_password(&self) -> bool {
+        matches!(self, TelegramAuthStage::Password)
+    }
+}
+
+#[derive(Debug)]
+pub struct TelegramAuthState {
+    pub stage: TelegramAuthStage,
+    pub input: String,
+    /// Optional error hint from retry (e.g. "Wrong code, try again")
+    pub error_hint: Option<String>,
+}
+
+impl TelegramAuthState {
+    pub fn new(stage: TelegramAuthStage, error_hint: Option<String>) -> Self {
+        Self {
+            stage,
+            input: String::new(),
+            error_hint,
+        }
     }
 }
 
@@ -217,6 +329,7 @@ pub struct AppState {
     pub settings_state: Option<SettingsState>,
     pub chat_menu_state: Option<ChatMenuState>,
     pub search_state: Option<SearchState>,
+    pub telegram_auth_state: Option<TelegramAuthState>,
     pub ai_suggestion: Option<String>,
     pub ai_status: Option<String>,
     pub ai_debug: bool,
@@ -224,6 +337,13 @@ pub struct AppState {
     pub enter_sends: bool,
     /// Number of unread messages at the tail of `messages` when a chat was opened.
     pub new_message_count: usize,
+    /// Transient copy feedback: Some("Copied!") briefly after y is pressed.
+    pub copy_status: Option<String>,
+    /// Index into `messages` of the currently highlighted message in MessageSelect mode.
+    pub selected_message_idx: Option<usize>,
+    pub schedule_prompt_state: Option<SchedulePromptState>,
+    pub schedule_list_state: Option<ScheduleListState>,
+    pub schedule_status: Option<String>, // flash message for scheduling feedback
 }
 
 impl AppState {
@@ -246,12 +366,18 @@ impl AppState {
             settings_state: None,
             chat_menu_state: None,
             search_state: None,
+            telegram_auth_state: None,
             ai_suggestion: None,
             ai_status: None,
             ai_debug: false,
             ai_debug_log: Vec::new(),
             enter_sends: true,
             new_message_count: 0,
+            copy_status: None,
+            selected_message_idx: None,
+            schedule_prompt_state: None,
+            schedule_list_state: None,
+            schedule_status: None,
         }
     }
 
@@ -343,7 +469,9 @@ impl AppState {
             if let Some(chat) = self.chats.get(idx) {
                 self.chat_menu_state = Some(ChatMenuState::new(
                     chat.id.clone(),
-                    chat.display_name.clone().unwrap_or_else(|| chat.name.clone()),
+                    chat.display_name
+                        .clone()
+                        .unwrap_or_else(|| chat.name.clone()),
                     chat.is_pinned,
                     chat.is_muted,
                 ));
@@ -368,5 +496,57 @@ impl AppState {
 
     pub fn has_unread(&self) -> bool {
         self.chats.iter().any(|c| !c.is_muted && c.unread_count > 0)
+    }
+
+    /// Enter message-selection mode, starting at the last message.
+    pub fn enter_message_select(&mut self) {
+        if self.messages.is_empty() {
+            return;
+        }
+        self.selected_message_idx = Some(self.messages.len() - 1);
+        self.input_mode = InputMode::MessageSelect;
+        self.active_panel = ActivePanel::MessageView;
+    }
+
+    /// Exit message-selection mode.
+    pub fn exit_message_select(&mut self) {
+        self.selected_message_idx = None;
+        self.input_mode = InputMode::Normal;
+    }
+
+    /// Move selection up (toward older messages).
+    pub fn message_select_prev(&mut self) {
+        if let Some(idx) = self.selected_message_idx {
+            if idx > 0 {
+                self.selected_message_idx = Some(idx - 1);
+            }
+        }
+    }
+
+    /// Move selection down (toward newer messages).
+    pub fn message_select_next(&mut self) {
+        if let Some(idx) = self.selected_message_idx {
+            if idx + 1 < self.messages.len() {
+                self.selected_message_idx = Some(idx + 1);
+            }
+        }
+    }
+
+    pub fn open_telegram_auth(&mut self, stage: TelegramAuthStage, error_hint: Option<String>) {
+        self.telegram_auth_state = Some(TelegramAuthState::new(stage, error_hint));
+        self.input_mode = InputMode::TelegramAuth;
+    }
+
+    pub fn close_telegram_auth(&mut self) {
+        self.telegram_auth_state = None;
+        self.input_mode = InputMode::Normal;
+    }
+
+    pub fn take_telegram_auth_input(&mut self) -> String {
+        if let Some(ref mut auth) = self.telegram_auth_state {
+            std::mem::take(&mut auth.input)
+        } else {
+            String::new()
+        }
     }
 }

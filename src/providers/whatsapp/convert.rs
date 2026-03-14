@@ -1,19 +1,36 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::mpsc;
 use whatsapp_rust::proto_helpers::MessageExt;
 use whatsapp_rust::waproto::whatsapp as wa;
 use whatsapp_rust::Jid;
 
+use crate::core::provider::ProviderEvent;
 use crate::core::types::*;
 
 /// Cache mapping LID JID strings to their PN (phone number) JID equivalents.
 /// WhatsApp uses two JID formats for the same person:
 /// - PN: `559985213786@s.whatsapp.net`
 /// - LID: `39492358562039@lid`
-#[derive(Clone, Default)]
+///
+/// When a new mapping is discovered the cache emits a
+/// `ProviderEvent::LidPnMappingDiscovered` so the app layer can persist it and
+/// remove any stale `@lid` chat entry.
+#[derive(Clone)]
 pub struct JidCache {
     lid_to_pn: Arc<Mutex<HashMap<String, String>>>,
+    /// Optional channel used to notify the app of newly discovered mappings.
+    tx: Option<mpsc::UnboundedSender<ProviderEvent>>,
+}
+
+impl Default for JidCache {
+    fn default() -> Self {
+        Self {
+            lid_to_pn: Arc::new(Mutex::new(HashMap::new())),
+            tx: None,
+        }
+    }
 }
 
 impl JidCache {
@@ -21,22 +38,55 @@ impl JidCache {
         Self::default()
     }
 
+    /// Pre-populate the cache with previously persisted mappings (loaded from DB
+    /// on startup) so that LID JIDs are normalised correctly from the first event.
+    pub fn new_with_mappings(
+        map: HashMap<String, String>,
+        tx: mpsc::UnboundedSender<ProviderEvent>,
+    ) -> Self {
+        Self {
+            lid_to_pn: Arc::new(Mutex::new(map)),
+            tx: Some(tx),
+        }
+    }
+
     /// Record a mapping between two JIDs (auto-detects LID vs PN).
+    /// Emits `LidPnMappingDiscovered` when a genuinely new mapping is added.
     pub fn record_mapping(&self, jid_a: &Jid, jid_b: &Jid) {
         let a = jid_a.to_string();
         let b = jid_b.to_string();
-        let mut map = self.lid_to_pn.lock().unwrap();
         if a.ends_with("@lid") && !b.ends_with("@lid") {
-            map.insert(a, b);
+            self.insert_if_new(a, b);
         } else if b.ends_with("@lid") && !a.ends_with("@lid") {
-            map.insert(b, a);
+            self.insert_if_new(b, a);
         }
     }
 
     /// Record a direct LID→PN string mapping.
+    /// Emits `LidPnMappingDiscovered` when a genuinely new mapping is added.
     pub fn record_lid_to_pn(&self, lid_jid_str: &str, pn_jid_str: &str) {
-        let mut map = self.lid_to_pn.lock().unwrap();
-        map.insert(lid_jid_str.to_string(), pn_jid_str.to_string());
+        self.insert_if_new(lid_jid_str.to_string(), pn_jid_str.to_string());
+    }
+
+    /// Insert lid→pn only if not already present; emit event for new entries.
+    fn insert_if_new(&self, lid: String, pn: String) {
+        let is_new = {
+            let mut map = self.lid_to_pn.lock().unwrap();
+            if map.contains_key(&lid) {
+                false
+            } else {
+                map.insert(lid.clone(), pn.clone());
+                true
+            }
+        };
+        if is_new {
+            if let Some(ref tx) = self.tx {
+                let _ = tx.send(ProviderEvent::LidPnMappingDiscovered {
+                    lid: lid.clone(),
+                    pn: pn.clone(),
+                });
+            }
+        }
     }
 
     /// Resolve a JID string: if it's a LID with a known PN, return the PN string.
@@ -66,6 +116,7 @@ pub fn chat_id_to_jid(chat_id: &str) -> Option<Jid> {
 }
 
 /// Convert a WhatsApp message + info into our UnifiedMessage.
+#[allow(clippy::too_many_arguments)]
 pub fn wa_message_to_unified(
     msg: &wa::Message,
     push_name: &str,
@@ -195,6 +246,41 @@ fn extract_message_content(msg: &wa::Message) -> Option<MessageContent> {
     let base = msg.get_base_message();
 
     if let Some(ref img) = base.image_message {
+        // Build decryption params when the proto carries the necessary E2EE fields.
+        // WhatsApp E2EE images always have media_key + direct_path + file_enc_sha256.
+        let decrypt_params = match (
+            img.media_key.as_deref(),
+            img.direct_path.as_deref(),
+            img.file_sha256.as_deref(),
+            img.file_enc_sha256.as_deref(),
+            img.file_length,
+        ) {
+            (Some(key), Some(path), Some(sha256), Some(enc_sha256), Some(len))
+                if !key.is_empty() =>
+            {
+                Some(MediaDecryptParams {
+                    media_key: key.to_vec(),
+                    direct_path: path.to_string(),
+                    file_sha256: sha256.to_vec(),
+                    file_enc_sha256: enc_sha256.to_vec(),
+                    file_length: len,
+                    mime_type: img.mimetype.clone(),
+                })
+            }
+            _ => None,
+        };
+
+        if let Some(ref url) = img.url {
+            if !url.is_empty() {
+                let caption = img.caption.clone().filter(|s| !s.is_empty());
+                return Some(MessageContent::Image {
+                    url: url.clone(),
+                    caption,
+                    decrypt_params,
+                });
+            }
+        }
+        // Fallback: no URL available — render as text placeholder
         return Some(MessageContent::Text(
             match img.caption.as_deref().filter(|s| !s.is_empty()) {
                 Some(c) => format!("[Image] {}", c),
@@ -252,4 +338,81 @@ fn extract_message_content(msg: &wa::Message) -> Option<MessageContent> {
 /// Strip the @server suffix from a JID string.
 fn strip_jid_server(jid_str: &str) -> String {
     jid_str.split('@').next().unwrap_or(jid_str).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wa::message::ImageMessage;
+    use whatsapp_rust::waproto::whatsapp as wa;
+
+    /// When image_message has a URL but no E2EE keys, decrypt_params is None.
+    #[test]
+    fn test_image_message_with_url_no_keys_returns_image_content() {
+        let mut msg = wa::Message::default();
+        let mut img = ImageMessage::default();
+        img.url = Some("https://cdn.example.com/img.jpg".to_string());
+        img.caption = Some("A caption".to_string());
+        msg.image_message = Some(Box::new(img));
+        let content = extract_message_content(&msg).unwrap();
+        match content {
+            MessageContent::Image {
+                url,
+                caption,
+                decrypt_params,
+            } => {
+                assert_eq!(url, "https://cdn.example.com/img.jpg");
+                assert_eq!(caption, Some("A caption".to_string()));
+                assert!(
+                    decrypt_params.is_none(),
+                    "no E2EE keys → decrypt_params should be None"
+                );
+            }
+            other => panic!("Expected Image, got {:?}", other),
+        }
+    }
+
+    /// When image_message has URL + E2EE keys, decrypt_params is populated.
+    #[test]
+    fn test_image_message_with_url_and_keys_returns_decrypt_params() {
+        let mut msg = wa::Message::default();
+        let mut img = ImageMessage::default();
+        img.url = Some("https://mmg.whatsapp.net/enc-blob".to_string());
+        img.media_key = Some(vec![0xAB; 32]);
+        img.direct_path = Some("/v/path/to/media".to_string());
+        img.file_sha256 = Some(vec![0x01; 32]);
+        img.file_enc_sha256 = Some(vec![0x02; 32]);
+        img.file_length = Some(12345);
+        img.mimetype = Some("image/jpeg".to_string());
+        msg.image_message = Some(Box::new(img));
+        let content = extract_message_content(&msg).unwrap();
+        match content {
+            MessageContent::Image {
+                url,
+                decrypt_params,
+                ..
+            } => {
+                assert_eq!(url, "https://mmg.whatsapp.net/enc-blob");
+                let p = decrypt_params.expect("E2EE keys present → decrypt_params should be Some");
+                assert_eq!(p.media_key, vec![0xAB; 32]);
+                assert_eq!(p.direct_path, "/v/path/to/media");
+                assert_eq!(p.file_length, 12345);
+                assert_eq!(p.mime_type, Some("image/jpeg".to_string()));
+            }
+            other => panic!("Expected Image, got {:?}", other),
+        }
+    }
+
+    /// When image_message has no URL, fall back to Text("[Image]").
+    #[test]
+    fn test_image_message_no_url_falls_back_to_text() {
+        let mut msg = wa::Message::default();
+        let img = ImageMessage::default(); // url = None
+        msg.image_message = Some(Box::new(img));
+        let content = extract_message_content(&msg).unwrap();
+        match content {
+            MessageContent::Text(t) => assert!(t.contains("[Image]")),
+            other => panic!("Expected Text fallback, got {:?}", other),
+        }
+    }
 }

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::{
     execute,
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
@@ -20,10 +20,11 @@ use crate::core::types::{AuthStatus, MessageContent, Platform};
 use crate::core::MessageRouter;
 use crate::providers::mock::MockProvider;
 use crate::providers::whatsapp::WhatsAppProvider;
-use crate::storage::{AddressBook, Database};
+use crate::storage::{AddressBook, Database, ScheduledMessage};
 use tui_textarea::TextArea;
 
-use crate::tui::app_state::{AppState, ChatMenuItem, InputMode, SearchState, SettingsKey, SettingsValue};
+use crate::tui::app_state::{AppState, ChatMenuItem, InputMode, SchedulePromptState, ScheduleListState, SearchState, SettingsKey, SettingsValue};
+use crate::tui::time_parse::{parse_schedule_time, format_local_time};
 use crate::tui::event::{AppEvent, EventHandler};
 use crate::tui::keybindings::{map_key, Action};
 use crate::tui::render;
@@ -41,6 +42,9 @@ pub struct App {
     last_keystroke: Option<Instant>,
     db_summary_tx: tokio::sync::mpsc::UnboundedSender<(String, String)>,
     db_summary_rx: tokio::sync::mpsc::UnboundedReceiver<(String, String)>,
+    schedule_status_ticks: u8,
+    telegram_auth_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::providers::telegram::AuthInput>>,
+    event_tx: tokio::sync::mpsc::UnboundedSender<AppEvent>,
 }
 
 impl App {
@@ -66,7 +70,7 @@ impl App {
                 _           => Box::new(OpenAiClient::new(config.ai.base_url.clone(), config.ai.api_key.clone())),
             };
             tracing::info!("AI worker created — autocomplete enabled");
-            Some(AiWorker::new(provider, config.ai.clone(), event_tx))
+            Some(AiWorker::new(provider, config.ai.clone(), event_tx.clone()))
         } else {
             tracing::info!("AI worker NOT created — ai.enabled = false in config");
             None
@@ -88,6 +92,9 @@ impl App {
             last_keystroke: None,
             db_summary_tx,
             db_summary_rx,
+            schedule_status_ticks: 0,
+            telegram_auth_tx: None,
+            event_tx,
         }
     }
 
@@ -114,12 +121,38 @@ impl App {
                 "{}/whatsapp-session.db",
                 self.config.general.data_dir
             );
-            let wa = WhatsAppProvider::new(session_path);
+            let lid_mappings = self.db.load_lid_mappings().unwrap_or_default();
+            let wa = WhatsAppProvider::new_with_lid_mappings(session_path, lid_mappings);
             self.router.register_provider(Box::new(wa));
+        }
+
+        if self.config.telegram.enabled {
+            let api_id = self.config.telegram.api_id;
+            let api_hash = self.config.telegram.api_hash.clone();
+
+            if api_id == 0 || api_hash.is_empty() {
+                tracing::error!(
+                    "Telegram enabled but api_id or api_hash not configured — skipping"
+                );
+            } else {
+                let session_path = format!(
+                    "{}/telegram-session.db",
+                    self.config.general.data_dir
+                );
+                let tg = crate::providers::telegram::TelegramProvider::new(
+                    api_id,
+                    api_hash,
+                    session_path,
+                );
+                // Stash the auth_tx so we can forward TUI input to the provider's auth task
+                self.telegram_auth_tx = Some(tg.auth_tx.clone());
+                self.router.register_provider(Box::new(tg));
+            }
         }
 
         // Start all providers
         self.router.start_all().await?;
+        tokio::task::spawn_blocking(crate::tui::media::cleanup_temp_images);
 
         // Track which providers are enabled for status bar
         self.state.mock_enabled = self.config.mock_provider.enabled;
@@ -131,6 +164,7 @@ impl App {
                 .filter(|c| match c.platform {
                     Platform::Mock => self.config.mock_provider.enabled,
                     Platform::WhatsApp => self.config.whatsapp.enabled,
+                    Platform::Telegram => self.config.telegram.enabled,
                     _ => true,
                 })
                 .collect();
@@ -166,11 +200,16 @@ impl App {
         // Load messages for the initially selected chat
         self.load_selected_chat_messages();
 
+        // Send any overdue scheduled messages
+        self.check_scheduled_messages().await;
+
         // Set initial terminal title
         self.refresh_title();
 
         // Set up terminal
         enable_raw_mode()?;
+        // EventStream::new() requires raw mode to be active — start the task now.
+        events.start();
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
         let backend = CrosstermBackend::new(stdout);
@@ -237,6 +276,7 @@ impl App {
                             }
                         }
                     }
+                    self.check_scheduled_messages().await;
                 }
                 Some(AppEvent::Key(key)) => {
                     let action = map_key(key, self.state.input_mode, self.state.enter_sends);
@@ -270,6 +310,10 @@ impl App {
                     self.state.push_ai_log(format!("[error] ← {}", e));
                     self.state.ai_status = Some(format!("AI: {}", e));
                 }
+                Some(AppEvent::MediaError(e)) => {
+                    tracing::error!(error = %e, "Media open error");
+                    self.state.copy_status = Some(e);
+                }
                 Some(AppEvent::Quit) | None => {
                     break;
                 }
@@ -291,6 +335,19 @@ impl App {
     }
 
     fn handle_tick(&mut self) {
+        // Clear transient copy status after one tick so it disappears quickly
+        self.state.copy_status = None;
+
+        if self.state.schedule_status.is_some() {
+            self.schedule_status_ticks += 1;
+            if self.schedule_status_ticks >= 8 {
+                self.state.schedule_status = None;
+                self.schedule_status_ticks = 0;
+            }
+        } else {
+            self.schedule_status_ticks = 0;
+        }
+
         let events = self.router.poll_events();
 
         // Cap events per tick to avoid blocking the render loop
@@ -470,6 +527,18 @@ impl App {
                             _ => {}
                         }
                     }
+                    if platform == Platform::Telegram {
+                        match status {
+                            AuthStatus::Authenticated => {
+                                self.state.close_telegram_auth();
+                            }
+                            AuthStatus::Failed => {
+                                self.state.close_telegram_auth();
+                                tracing::error!("Telegram authentication failed");
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 ProviderEvent::AuthQrCode(code) => {
                     tracing::info!("QR code received for WhatsApp pairing");
@@ -491,6 +560,47 @@ impl App {
                     tracing::info!("Sync completed, refreshing current chat");
                     self.load_selected_chat_messages();
                     self.refresh_title();
+                }
+                ProviderEvent::AuthPhonePrompt(platform, error_hint) => {
+                    if platform == Platform::Telegram {
+                        self.state.open_telegram_auth(
+                            crate::tui::app_state::TelegramAuthStage::Phone,
+                            error_hint,
+                        );
+                    }
+                }
+                ProviderEvent::AuthOtpPrompt(platform, error_hint) => {
+                    if platform == Platform::Telegram {
+                        self.state.open_telegram_auth(
+                            crate::tui::app_state::TelegramAuthStage::Otp,
+                            error_hint,
+                        );
+                    }
+                }
+                ProviderEvent::AuthPasswordPrompt(platform, error_hint) => {
+                    if platform == Platform::Telegram {
+                        self.state.open_telegram_auth(
+                            crate::tui::app_state::TelegramAuthStage::Password,
+                            error_hint,
+                        );
+                    }
+                }
+                ProviderEvent::LidPnMappingDiscovered { lid, pn } => {
+                    if let Err(e) = self.db.save_lid_mapping(&lid, &pn) {
+                        tracing::error!("Failed to save LID mapping: {}", e);
+                    }
+                    // Remove stale @lid chat from DB and in-memory state
+                    let lid_chat_id = format!("wa-{}", lid);
+                    if let Err(e) = self.db.delete_lid_chat(&lid_chat_id) {
+                        tracing::error!("Failed to delete stale @lid chat: {}", e);
+                    }
+                    self.state.chats.retain(|c| c.id != lid_chat_id);
+                    tracing::info!(
+                        "LID→PN mapping recorded: {} → {}; removed stale chat {}",
+                        lid,
+                        pn,
+                        lid_chat_id
+                    );
                 }
             }
         }
@@ -790,7 +900,282 @@ impl App {
                     }
                 }
             }
+            Action::CopyLastMessage => {
+                if let Some(msg) = self.state.messages.last() {
+                    let text = msg.content.as_text().to_string();
+                    copy_to_clipboard(&text);
+                    self.state.copy_status = Some("Copied!".to_string());
+                }
+            }
+            Action::EnterMessageSelect => {
+                self.state.enter_message_select();
+            }
+            Action::MessageSelectPrev => {
+                self.state.message_select_prev();
+            }
+            Action::MessageSelectNext => {
+                self.state.message_select_next();
+            }
+            Action::MessageSelectCopy => {
+                if let Some(idx) = self.state.selected_message_idx {
+                    if let Some(msg) = self.state.messages.get(idx) {
+                        let text = msg.content.as_text().to_string();
+                        copy_to_clipboard(&text);
+                        self.state.copy_status = Some("Copied!".to_string());
+                    }
+                }
+                self.state.exit_message_select();
+            }
+            Action::MessageSelectExit => {
+                self.state.exit_message_select();
+            }
+            Action::OpenMedia => {
+                if let Some(idx) = self.state.selected_message_idx {
+                    if let Some(msg) = self.state.messages.get(idx) {
+                        match &msg.content {
+                            MessageContent::Image { url, decrypt_params, .. } => {
+                                let url = url.clone();
+                                let platform = msg.platform;
+
+                                if let Some(params) = decrypt_params.clone() {
+                                    // E2EE path: download + decrypt via provider, then open
+                                    if let Some(provider) = self.router.get_provider_mut(platform) {
+                                        match provider.download_media(&params).await {
+                                            Ok(bytes) => {
+                                                let cache_key = params.direct_path.clone();
+                                                let mime = params.mime_type.clone();
+                                                let err_tx = self.event_tx.clone();
+                                                tokio::spawn(async move {
+                                                    if let Err(e) = crate::tui::media::open_image_from_bytes(
+                                                        bytes,
+                                                        &cache_key,
+                                                        mime.as_deref(),
+                                                    )
+                                                    .await
+                                                    {
+                                                        tracing::error!("Failed to open image: {}", e);
+                                                        let _ = err_tx.send(AppEvent::MediaError(
+                                                            format!("Failed to open image: {}", e),
+                                                        ));
+                                                    }
+                                                });
+                                                self.state.copy_status = Some("Opening image...".to_string());
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("Failed to download media: {}", e);
+                                                self.state.copy_status = Some(format!("Failed to download image: {}", e));
+                                            }
+                                        }
+                                    } else {
+                                        tracing::error!("No provider found for platform {:?}", platform);
+                                        self.state.copy_status = Some("No provider for this message".to_string());
+                                    }
+                                } else {
+                                    // No decrypt params — the image is E2EE encrypted on the CDN
+                                    // but the decryption keys were not captured when this message
+                                    // was received (e.g. older messages synced from history).
+                                    self.state.copy_status = Some(
+                                        "Image cannot be opened — decryption keys unavailable (message received before key capture was supported)".to_string(),
+                                    );
+                                }
+                            }
+                            MessageContent::Text(t) if t.contains("[Image]") => {
+                                // Old history-sync messages stored as Text("[Image]") before
+                                // image viewing support was added — no download URL available.
+                                self.state.copy_status = Some(
+                                    "Image not available — received before image viewing was supported".to_string(),
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                self.state.exit_message_select();
+            }
+            // Schedule actions
+            Action::ScheduleMessage => {
+                let input = self.state.take_input();
+                if !input.is_empty() {
+                    if let Some(chat_id) = self.state.selected_chat_id().map(|s| s.to_string()) {
+                        let platform = self.state.chats.iter()
+                            .find(|c| c.id == chat_id)
+                            .map(|c| c.platform)
+                            .unwrap_or(Platform::Mock);
+                        self.state.schedule_prompt_state = Some(SchedulePromptState::new(
+                            input, chat_id, platform,
+                        ));
+                        self.state.input_mode = InputMode::SchedulePrompt;
+                    }
+                }
+            }
+            Action::ScheduleInput(key) => {
+                if let Some(ref mut sp) = self.state.schedule_prompt_state {
+                    match key.code {
+                        KeyCode::Backspace => { sp.query.pop(); }
+                        KeyCode::Char(c) => { sp.query.push(c); }
+                        _ => {}
+                    }
+                }
+            }
+            Action::ScheduleConfirm => {
+                if let Some(sp) = self.state.schedule_prompt_state.take() {
+                    if let Some(send_at) = parse_schedule_time(&sp.query) {
+                        let msg = ScheduledMessage {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            chat_id: sp.chat_id,
+                            platform: sp.platform,
+                            content: MessageContent::Text(sp.message_text),
+                            send_at,
+                            status: "pending".to_string(),
+                            created_at: chrono::Utc::now(),
+                        };
+                        if let Err(e) = self.db.insert_scheduled_message(&msg) {
+                            tracing::error!("Failed to schedule message: {}", e);
+                        } else {
+                            self.state.schedule_status = Some(format!("Scheduled for {}", format_local_time(&send_at)));
+                            self.schedule_status_ticks = 0;
+                            tracing::info!("Scheduled message for {}", format_local_time(&send_at));
+                        }
+                    } else {
+                        self.state.schedule_status = Some("Could not parse time — try 'tomorrow 9am' or 'Mar 15 14:30'".to_string());
+                        self.schedule_status_ticks = 0;
+                    }
+                    self.state.input_mode = InputMode::Editing;
+                }
+            }
+            Action::ScheduleCancel => {
+                if let Some(sp) = self.state.schedule_prompt_state.take() {
+                    // Put the message text back into the input
+                    self.state.input = TextArea::default();
+                    for ch in sp.message_text.chars() {
+                        self.state.input.insert_char(ch);
+                    }
+                }
+                self.state.input_mode = InputMode::Editing;
+            }
+            Action::OpenScheduleList => {
+                match self.db.get_pending_scheduled_messages() {
+                    Ok(messages) => {
+                        self.state.schedule_list_state = Some(ScheduleListState::new(messages));
+                        self.state.input_mode = InputMode::ScheduleList;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to load scheduled messages: {}", e);
+                    }
+                }
+            }
+            Action::ScheduleListNext => {
+                if let Some(ref mut sl) = self.state.schedule_list_state {
+                    sl.select_next();
+                }
+            }
+            Action::ScheduleListPrev => {
+                if let Some(ref mut sl) = self.state.schedule_list_state {
+                    sl.select_prev();
+                }
+            }
+            Action::ScheduleListDelete => {
+                if let Some(ref mut sl) = self.state.schedule_list_state {
+                    if let Some(msg) = sl.messages.get(sl.selected) {
+                        match self.db.update_scheduled_status(&msg.id, "cancelled") {
+                            Ok(_) => {
+                                sl.messages.remove(sl.selected);
+                                if sl.selected > 0 && sl.selected >= sl.messages.len() {
+                                    sl.selected = sl.messages.len().saturating_sub(1);
+                                }
+                                self.state.schedule_status = Some("Schedule cancelled".to_string());
+                                self.schedule_status_ticks = 0;
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to cancel scheduled message: {}", e);
+                            }
+                        }
+                    }
+                    if sl.messages.is_empty() {
+                        self.state.schedule_list_state = None;
+                        self.state.input_mode = InputMode::Normal;
+                    }
+                }
+            }
+            Action::ScheduleListClose => {
+                self.state.schedule_list_state = None;
+                self.state.input_mode = InputMode::Normal;
+            }
+            Action::TelegramAuthChar(c) => {
+                if let Some(ref mut auth) = self.state.telegram_auth_state {
+                    if !c.is_control() {
+                        auth.input.push(c);
+                    }
+                }
+            }
+            Action::TelegramAuthBackspace => {
+                if let Some(ref mut auth) = self.state.telegram_auth_state {
+                    auth.input.pop();
+                }
+            }
+            Action::TelegramAuthSubmit => {
+                let value = self.state.take_telegram_auth_input();
+                if !value.trim().is_empty() {
+                    if let (Some(ref tx), Some(ref auth)) =
+                        (&self.telegram_auth_tx, &self.state.telegram_auth_state)
+                    {
+                        use crate::providers::telegram::AuthInput;
+                        use crate::tui::app_state::TelegramAuthStage;
+                        let auth_input = match auth.stage {
+                            TelegramAuthStage::Phone => AuthInput::Phone(value),
+                            TelegramAuthStage::Otp => AuthInput::Otp(value),
+                            TelegramAuthStage::Password => AuthInput::Password(value),
+                        };
+                        if tx.send(auth_input).is_err() {
+                            tracing::warn!("Telegram auth_tx send failed — receiver may have dropped");
+                        }
+                    }
+                    // Close overlay; it will re-open if auth needs another step
+                    self.state.close_telegram_auth();
+                }
+            }
+            Action::TelegramAuthCancel => {
+                self.state.close_telegram_auth();
+                tracing::info!("Telegram auth cancelled by user");
+            }
             Action::None => {}
+        }
+    }
+
+    async fn check_scheduled_messages(&mut self) {
+        let due = match self.db.get_due_scheduled_messages() {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                tracing::error!("Failed to query scheduled messages: {}", e);
+                return;
+            }
+        };
+
+        let mut sent_count = 0;
+        for msg in due {
+            let chat_id = msg.chat_id.clone();
+            let content = msg.content.clone();
+            if let Some(provider) = self.router.get_provider_mut(msg.platform) {
+                match provider.send_message(&chat_id, content).await {
+                    Ok(_) => {
+                        let _ = self.db.update_scheduled_status(&msg.id, "sent");
+                        sent_count += 1;
+                        tracing::info!("Sent scheduled message {} to {}", msg.id, chat_id);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to send scheduled message {}: {}", msg.id, e);
+                        // Leave as pending — will retry next tick
+                    }
+                }
+            }
+        }
+        if sent_count > 0 {
+            self.state.schedule_status = Some(format!(
+                "Sent {} scheduled message{}",
+                sent_count,
+                if sent_count == 1 { "" } else { "s" }
+            ));
+            self.schedule_status_ticks = 0;
         }
     }
 
@@ -895,4 +1280,40 @@ impl App {
         }
         None
     }
+}
+
+/// Copy text to the system clipboard using the OSC 52 terminal escape sequence.
+/// This works in most modern terminals (kitty, iTerm2, WezTerm, tmux with set-clipboard on, etc.).
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    let encoded = base64_encode(text.as_bytes());
+    // OSC 52 ; c ; <base64> ST
+    let osc52 = format!("\x1b]52;c;{}\x07", encoded);
+    let _ = std::io::stdout().write_all(osc52.as_bytes());
+    let _ = std::io::stdout().flush();
+}
+
+/// Minimal base64 encoder (no external crate needed).
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(n & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }

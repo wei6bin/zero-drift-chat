@@ -1,13 +1,16 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
 use super::app_state::{AppState, InputMode};
-use super::widgets::{self, chat_list, input_bar, message_view, qr_overlay, settings_overlay, status_bar};
+use super::widgets::{
+    self, chat_list, input_bar, message_view, qr_overlay, settings_overlay, status_bar,
+    telegram_auth_overlay,
+};
 
 pub fn draw(f: &mut Frame, state: &mut AppState) {
     let outer = Layout::default()
@@ -67,6 +70,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         state.scroll_offset,
         state.active_panel,
         state.new_message_count,
+        state.selected_message_idx,
     );
 
     input_bar::render_input_bar(
@@ -85,22 +89,27 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
                 Style::default().fg(Color::DarkGray),
             ))]
         } else {
-            state.ai_debug_log.iter().map(|entry| {
-                let color = if entry.starts_with("[error]") {
-                    Color::Red
-                } else if entry.starts_with("[suggestion]") {
-                    Color::Green
-                } else {
-                    Color::Cyan
-                };
-                Line::from(Span::styled(entry.as_str(), Style::default().fg(color)))
-            }).collect()
+            state
+                .ai_debug_log
+                .iter()
+                .map(|entry| {
+                    let color = if entry.starts_with("[error]") {
+                        Color::Red
+                    } else if entry.starts_with("[suggestion]") {
+                        Color::Green
+                    } else {
+                        Color::Cyan
+                    };
+                    Line::from(Span::styled(entry.as_str(), Style::default().fg(color)))
+                })
+                .collect()
         };
-        let debug_widget = Paragraph::new(log_lines)
-            .block(Block::default()
+        let debug_widget = Paragraph::new(log_lines).block(
+            Block::default()
                 .title(" AI Debug ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)));
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
         f.render_widget(debug_widget, debug_area);
     }
 
@@ -111,6 +120,8 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         state.enter_sends,
         state.mock_enabled,
         state.whatsapp_connected,
+        state.copy_status.as_deref(),
+        state.schedule_status.as_deref(),
     );
 
     // Render QR code overlay on top if present
@@ -135,5 +146,50 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         if let Some(ref search) = state.search_state {
             widgets::search_overlay::render_search_overlay(f, chat_list_area, search, &state.chats);
         }
+    }
+
+    // Render schedule time prompt (replaces input area)
+    if state.input_mode == InputMode::SchedulePrompt {
+        if let Some(ref sp) = state.schedule_prompt_state {
+            let prompt_line = Line::from(vec![
+                Span::styled(
+                    "Schedule for: ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("{}▌", sp.query), Style::default().fg(Color::White)),
+            ]);
+            let prompt_widget = Paragraph::new(prompt_line).block(
+                Block::default()
+                    .title(" Schedule ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow)),
+            );
+            f.render_widget(Clear, input_area);
+            f.render_widget(prompt_widget, input_area);
+        }
+    }
+
+    // Render scheduled messages overlay
+    if state.input_mode == InputMode::ScheduleList {
+        if let Some(ref sl) = state.schedule_list_state {
+            let chat_names: std::collections::HashMap<String, String> = state
+                .chats
+                .iter()
+                .map(|c| {
+                    (
+                        c.id.clone(),
+                        c.display_name.clone().unwrap_or_else(|| c.name.clone()),
+                    )
+                })
+                .collect();
+            widgets::schedule_overlay::render_schedule_list_overlay(f, sl, &chat_names);
+        }
+    }
+
+    // Render Telegram auth overlay on top if active
+    if let Some(ref auth_state) = state.telegram_auth_state {
+        telegram_auth_overlay::render_telegram_auth_overlay(f, auth_state);
     }
 }
